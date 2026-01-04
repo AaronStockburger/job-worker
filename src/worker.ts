@@ -1,5 +1,6 @@
 import { ZBClient, ZBWorkerTaskHandler } from 'zeebe-node';
 import axios from 'axios';
+import 'dotenv/config';
 
 // Eingabe-/Header-/Ausgabe-Typen für den Job
 type InputVars = {
