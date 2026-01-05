@@ -5,6 +5,7 @@ import "dotenv/config";
 /* ========= Typen ========= */
 
 type Weather = "gut" | "mittel" | "schlecht";
+type Entscheidung = "standardVerfahren" | "erweiterteAnalyse";
 
 type SegmentInput = {
   weather: Weather;
@@ -14,7 +15,7 @@ type SegmentInput = {
 };
 
 type ProcessVars = {
-  analysisMode?: "standard" | "extended";
+  entscheidung?: Entscheidung; // <- genau diese Variable kommt aus Camunda
 
   segmentA_weather: Weather;
   segmentA_incidents: number;
@@ -52,13 +53,16 @@ type OutputVars = {
   topRiskSegment: string;
   overloadProbability: number;
   riskLevel: "LOW" | "MEDIUM" | "HIGH";
+
   recommendationCode: RecommendationCode;
   recommendationText: string;
+
+  // welches Verfahren wurde tatsächlich genutzt
   analysisModeUsed: "standard" | "extended";
+  decisionUsed: Entscheidung;
 };
 
 /* ========= Zeebe Client ========= */
-/* Liest alles automatisch aus .env */
 const zbc = new ZBClient();
 
 /* ========= Hilfsfunktionen ========= */
@@ -94,90 +98,82 @@ function riskLevelFrom(prob: number): "LOW" | "MEDIUM" | "HIGH" {
 }
 
 function recommendationFrom(prob: number): { code: RecommendationCode; text: string } {
-  if (prob < 0.4) {
-    return {
-      code: "NO_ACTION",
-      text: "Keine Maßnahme nötig, weiter beobachten."
-    };
-  }
-  if (prob < 0.7) {
-    return {
-      code: "MANUAL_REVIEW",
-      text: "Manuelle Prüfung durch Netzingenieur empfohlen."
-    };
-  }
-  return {
-    code: "MEASURE_REQUIRED",
-    text: "Maßnahme erforderlich: Wartung oder Netzverstärkung zeitnah einplanen."
-  };
+  if (prob < 0.4) return { code: "NO_ACTION", text: "Keine Maßnahme nötig, weiter beobachten." };
+  if (prob < 0.7) return { code: "MANUAL_REVIEW", text: "Manuelle Prüfung durch Netzingenieur empfohlen." };
+  return { code: "MEASURE_REQUIRED", text: "Maßnahme erforderlich: Wartung/Verstärkung zeitnah einplanen." };
+}
+
+// Mapping: Camunda-Variable `entscheidung` -> JSON-Profil-ID
+function mapEntscheidungToMode(e?: Entscheidung): { mode: "standard" | "extended"; decisionUsed: Entscheidung } {
+  const decisionUsed: Entscheidung = e ?? "standardVerfahren";
+  const mode: "standard" | "extended" = decisionUsed === "erweiterteAnalyse" ? "extended" : "standard";
+  return { mode, decisionUsed };
 }
 
 /* ========= Job Handler ========= */
 
-const handler: ZBWorkerTaskHandler<ProcessVars, Record<string, unknown>, OutputVars> =
-  async (job) => {
+const handler: ZBWorkerTaskHandler<ProcessVars, Record<string, unknown>, OutputVars> = async (job) => {
+  const vars = job.variables;
 
-    const vars = job.variables;
-    const mode: "standard" | "extended" = vars.analysisMode ?? "standard";
+  // 1) Verfahren wählen (NACH deiner Entscheidung)
+  const { mode, decisionUsed } = mapEntscheidungToMode(vars.entscheidung);
+  console.log("Job erhalten – entscheidung =", decisionUsed, "=> analysisModeUsed =", mode);
 
-    console.log("Job erhalten – Analysemodus:", mode);
+  // 2) Profil holen (slowed-down JSON server simuliert Laufzeit)
+  const profileUrl = `http://localhost:3000/analysisProfiles/${mode}`;
+  console.log("Rufe Analyseprofil ab:", profileUrl);
 
-    // Analyseprofil vom slowed-down JSON-Server laden
-    const profileUrl = `http://localhost:3000/analysisProfiles/${mode}`;
-    console.log("Rufe Analyseprofil ab:", profileUrl);
+  let profile: AnalysisProfile;
+  try {
+    profile = (await axios.get<AnalysisProfile>(profileUrl, { timeout: 30_000 })).data;
+  } catch (err) {
+    console.error("Fehler beim Laden des Analyseprofils", err);
+    throw new Error("Risk analysis service unavailable");
+  }
 
-    let profile: AnalysisProfile;
-    try {
-      profile = (await axios.get<AnalysisProfile>(profileUrl, { timeout: 30000 })).data;
-    } catch (err) {
-      console.error("Fehler beim Laden des Analyseprofils", err);
-      throw new Error("Risk analysis service unavailable");
-    }
+  // 3) Risiko berechnen
+  const segments = toSegments(vars);
+  const segmentScores: Record<string, number> = {};
+  for (const [key, seg] of Object.entries(segments)) {
+    segmentScores[key] = scoreSegment(seg, profile);
+  }
 
-    // Scores berechnen
-    const segments = toSegments(vars);
-    const segmentScores: Record<string, number> = {};
+  const [topRiskSegment] = Object.entries(segmentScores).sort((a, b) => b[1] - a[1])[0];
+  const maxScore = segmentScores[topRiskSegment];
 
-    for (const [key, seg] of Object.entries(segments)) {
-      segmentScores[key] = scoreSegment(seg, profile);
-    }
+  const overloadProbability = calcOverloadProbability(maxScore, profile);
+  const riskLevel = riskLevelFrom(overloadProbability);
+  const rec = recommendationFrom(overloadProbability);
 
-    // Top-Risiko-Segment bestimmen
-    const [topRiskSegment] =
-      Object.entries(segmentScores).sort((a, b) => b[1] - a[1])[0];
+  console.log("Analyseergebnis:", {
+    segmentScores,
+    topRiskSegment,
+    overloadProbability,
+    riskLevel,
+    recommendationCode: rec.code,
+    analysisModeUsed: mode,
+  });
 
-    const maxScore = segmentScores[topRiskSegment];
-    const overloadProbability = calcOverloadProbability(maxScore, profile);
-    const riskLevel = riskLevelFrom(overloadProbability);
-    const recommendation = recommendationFrom(overloadProbability);
-
-    console.log("Analyseergebnis:", {
-      segmentScores,
-      topRiskSegment,
-      overloadProbability,
-      riskLevel,
-      recommendation: recommendation.code
-    });
-
-    return job.complete({
-      segmentScores,
-      topRiskSegment,
-      overloadProbability,
-      riskLevel,
-      recommendationCode: recommendation.code,
-      recommendationText: recommendation.text,
-      analysisModeUsed: mode
-    });
-  };
+  return job.complete({
+    segmentScores,
+    topRiskSegment,
+    overloadProbability,
+    riskLevel,
+    recommendationCode: rec.code,
+    recommendationText: rec.text,
+    analysisModeUsed: mode,
+    decisionUsed,
+  });
+};
 
 /* ========= Worker starten ========= */
 
 zbc.createWorker<ProcessVars, Record<string, unknown>, OutputVars>({
-  taskType: "risk-analysis", // MUSS exakt im BPMN stehen
+  taskType: "risk-analysis", // in BEIDEN Service Tasks gleich
   taskHandler: handler,
   timeout: 60_000,
   maxJobsToActivate: 1,
-  pollInterval: 2000
+  pollInterval: 2000,
 });
 
 console.log('Job-Worker läuft (taskType="risk-analysis").');
